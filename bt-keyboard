@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+#
+# bt-keyboard — быстрая настройка Bluetooth-клавиатуры (BLE HID) в Linux.
+#
+# Лечит типовую проблему: клавиатура «подключена», но не печатает.
+# Причина — протухший ключ сопряжения: BlueZ открывает соединение, но не может
+# поднять шифрование, не читает HID Report Map и поэтому не создаёт
+# input-устройство. Лечится перепаровкой.
+#
+# Использование:
+#   bt-keyboard                     # проверить, подключить, при неудаче перепарить
+#   bt-keyboard --repair            # сразу перепарить (нужен режим сопряжения)
+#   bt-keyboard --status            # только показать состояние
+#   bt-keyboard --test              # после настройки проверить живыми нажатиями
+#   bt-keyboard --no-test           # не предлагать проверку нажатий
+#   bt-keyboard --name "Lab31"      # другое имя устройства
+#   bt-keyboard --addr XX:XX:...    # задать адрес вручную
+#
+# Проверка нажатий читает /dev/input/event*, поэтому требует root
+# (sudo или pkexec). Без --test скрипт спрашивает разрешение, если есть терминал.
+#
+# Клавиатура во время --repair должна быть в режиме сопряжения:
+# индикатор Bluetooth быстро мигает. Скан выполняется автоматически.
+#
+set -uo pipefail
+
+# ------------------------------- настройки -----------------------------------
+NAME="Lab31"
+ADDR=""
+MODE="auto"                 # auto | repair | status
+TEST="ask"                  # ask | yes | no
+SCAN_TIME=10                # длительность одного захода сканирования, с
+SCAN_ROUNDS=9               # заходов (итого ~90 с ожидания режима сопряжения)
+VERIFY_TIMEOUT=20           # сколько ждать появления input-устройства, с
+CONNECT_TRIES=3             # попыток подключения
+KEYTEST_SECONDS=20          # сколько ждать первого нажатия, с
+
+# --------------------------------- вывод -------------------------------------
+if [ -t 1 ]; then
+    B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; D=$'\033[2m'; N=$'\033[0m'
+else
+    B=; G=; Y=; R=; D=; N=;
+fi
+step() { printf '%s==>%s %s\n' "$B" "$N" "$1"; }
+info() { printf '    %s\n' "$1"; }
+ok()   { printf '%s  ✓%s %s\n' "$G" "$N" "$1"; }
+warn() { printf '%s  !%s %s\n' "$Y" "$N" "$1"; }
+err()  { printf '%s  ✗%s %s\n' "$R" "$N" "$1" >&2; }
+die()  { err "$1"; exit 1; }
+
+usage() { sed -n '3,23p' "$0" | sed -e 's/^# \{0,1\}//'; exit 0; }
+
+# --------------------------------- аргументы ---------------------------------
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --name)   [ $# -ge 2 ] || die "--name требует значение"; NAME=$2; shift 2 ;;
+        --addr)   [ $# -ge 2 ] || die "--addr требует значение"; ADDR=$2; shift 2 ;;
+        --repair) MODE=repair; shift ;;
+        --status) MODE=status; shift ;;
+        --test)   TEST=yes; shift ;;
+        --no-test) TEST=no; shift ;;
+        -h|--help) usage ;;
+        *) die "неизвестный аргумент: $1 (см. --help)" ;;
+    esac
+done
+
+# ------------------------------- проверки ------------------------------------
+command -v bluetoothctl >/dev/null 2>&1 \
+    || die "не найден bluetoothctl. Установи BlueZ: sudo apt install bluez"
+
+step "Проверяю Bluetooth-адаптер"
+if ! bluetoothctl show >/dev/null 2>&1; then
+    die "нет связи с BlueZ. Проверь службу: systemctl status bluetooth"
+fi
+if ! bluetoothctl show | grep -q 'Powered: yes'; then
+    warn "адаптер выключен — включаю"
+    bluetoothctl power on >/dev/null 2>&1 || true
+    sleep 1
+fi
+adapter=$(bluetoothctl show | awk '/^Controller/{print $2; exit}')
+ok "адаптер ${adapter:-неизвестен} работает"
+
+# Узнаём адрес: из аргумента либо из списка известных устройств.
+if [ -z "$ADDR" ]; then
+    ADDR=$(bluetoothctl devices 2>/dev/null \
+           | awk -v n="$NAME" 'index($0,n){print $2; exit}')
+fi
+
+# --------------------------- вспомогательные функции -------------------------
+
+# Есть ли уже input-устройство с таким именем?
+input_present() {
+    grep -qiE "^N: Name=\"[^\"]*${NAME}[^\"]*\"" /proc/bus/input/devices 2>/dev/null
+}
+
+# Найти event-узел клавиатуры. Печатает полный путь, например /dev/input/event18.
+find_event_node() {
+    local node
+    node=$(awk -v n="$NAME" '
+        index($0, "N: Name=") && index($0, n) { found = 1 }
+        found && /^H: Handlers=/ {
+            for (i = 1; i <= NF; i++) if ($i ~ /^event[0-9]+$/) { print $i; exit }
+        }
+    ' /proc/bus/input/devices)
+    [ -n "$node" ] && printf '/dev/input/%s\n' "$node"
+}
+
+# Спросить у пользователя да/нет. Возвращает 0 при согласии.
+ask() {
+    [ -t 0 ] || return 1
+    printf '%s?%s %s %s[y/N]%s ' "$B" "$N" "$1" "$D" "$N"
+    local reply=""
+    read -r reply || reply=""
+    case "$reply" in
+        [yYдД]*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Выполнить команду от root (для чтения /dev/input/event*).
+run_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    elif command -v pkexec >/dev/null 2>&1; then
+        pkexec "$@"
+    else
+        err "нужен root: добавь себя в группу input или запусти скрипт от root"
+        return 1
+    fi
+}
+
+# Показать состояние клавиатуры. 0 — если работает.
+show_status() {
+    if input_present; then
+        local node; node=$(find_event_node)
+        ok "клавиатура «$NAME» зарегистрирована как input-устройство${node:+ ($node)}"
+    else
+        warn "input-устройства «$NAME» нет — клавиатура не печатает"
+    fi
+
+    if [ -n "$ADDR" ]; then
+        info "BlueZ:"
+        bluetoothctl info "$ADDR" 2>/dev/null \
+            | grep -iE "Name:|Paired:|Bonded:|Trusted:|Connected:|ServicesResolved:" \
+            | sed 's/^[[:space:]]*/      /'
+    fi
+
+    input_present
+}
+
+# Ждать появления input-устройства до VERIFY_TIMEOUT секунд.
+wait_input() {
+    local i
+    for i in $(seq 1 "$VERIFY_TIMEOUT"); do
+        input_present && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# Скан в поисках клавиатуры. При успехе выставляет ADDR, возвращает 0.
+discover() {
+    step "Ищу «$NAME» в эфире (до $((SCAN_TIME * SCAN_ROUNDS)) с)"
+    warn "переведи клавиатуру в режим сопряжения — индикатор Bluetooth должен быстро мигать"
+    warn "и убедись, что она не подключена к телефону или другому компьютеру"
+
+    local round log found
+    for round in $(seq 1 "$SCAN_ROUNDS"); do
+        log=$(mktemp)
+        # Сканируем с --timeout: по завершении скан гарантированно выключен.
+        if ! bluetoothctl --timeout "$SCAN_TIME" scan on >"$log" 2>&1; then
+            rm -f "$log"
+            die "bluetoothctl не поддерживает --timeout. Обнови BlueZ."
+        fi
+
+        if [ -n "$ADDR" ] && grep -q "$ADDR" "$log"; then
+            ok "клавиатура в эфире: $ADDR"; rm -f "$log"; return 0
+        fi
+        found=$(awk -v n="$NAME" 'index($0,n){print $2; exit}' "$log")
+        rm -f "$log"
+        if [ -n "$found" ]; then
+            ADDR=$found
+            ok "клавиатура в эфире: $ADDR"
+            return 0
+        fi
+        info "заход $round/$SCAN_ROUNDS — пока не вижу"
+    done
+    return 1
+}
+
+# Подключиться по сохранённому ключу и дождаться input-устройства.
+try_connect() {
+    step "Подключаюсь по сохранённому ключу"
+    local i
+    for i in $(seq 1 "$CONNECT_TRIES"); do
+        bluetoothctl connect "$ADDR" >/dev/null 2>&1 || true
+        if wait_input; then
+            ok "подключено, input-устройство создано"
+            return 0
+        fi
+        [ "$i" -lt "$CONNECT_TRIES" ] && warn "попытка $i не дала input-устройства — повторяю"
+    done
+    return 1
+}
+
+# Полная перепаровка: удалить ключ, найти заново, спарить.
+do_repair() {
+    if [ -n "$ADDR" ]; then
+        step "Удаляю старую привязку $ADDR"
+        bluetoothctl remove "$ADDR" >/dev/null 2>&1 || true
+        ok "старый ключ удалён"
+    fi
+
+    discover || return 1
+
+    # Скан уже остановлен — это важно: активное сканирование ломает сопряжение.
+    step "Сопрягаю $ADDR"
+    bluetoothctl pair "$ADDR" 2>&1 | sed 's/^/    /' || true
+    sleep 3
+
+    step "Доверяю устройству (автоподключение при загрузке)"
+    bluetoothctl trust "$ADDR" >/dev/null 2>&1 || true
+
+    step "Подключаю"
+    local i
+    for i in $(seq 1 "$CONNECT_TRIES"); do
+        bluetoothctl connect "$ADDR" >/dev/null 2>&1 || true
+        if wait_input; then
+            ok "готово"
+            return 0
+        fi
+        [ "$i" -lt "$CONNECT_TRIES" ] && warn "попытка $i не дала input-устройства — повторяю"
+    done
+    return 1
+}
+
+# Проверка живыми нажатиями: читаем event-устройство от root.
+test_keys() {
+    local node=$1
+    if [ -z "$node" ]; then
+        warn "event-устройство не найдено — проверка невозможна"
+        return 1
+    fi
+
+    step "Проверяю живыми нажатиями ($node)"
+    info "нажми клавишу на «$NAME» — если она спала, первое нажатие её разбудит"
+    info "жду первого нажатия до ${KEYTEST_SECONDS} с, дальше проверка завершится сама"
+
+    run_root python3 - "$node" "$KEYTEST_SECONDS" <<'PY'
+import os, select, struct, sys, time
+
+dev, wait_first = sys.argv[1], float(sys.argv[2])
+IDLE_AFTER = 6.0            # сколько ждать после последнего нажатия
+EV_KEY = 0x01
+ACT = {0: "отпущена", 1: "НАЖАТА", 2: "автоповтор"}
+NAMES = {
+    1: "ESC", 14: "BACKSPACE", 15: "TAB", 28: "ENTER", 29: "LEFTCTRL",
+    42: "LEFTSHIFT", 56: "LEFTALT", 57: "SPACE", 103: "UP", 105: "LEFT",
+    106: "RIGHT", 108: "DOWN",
+}
+for i, c in enumerate("1234567890"):
+    NAMES[2 + i] = c
+for i, c in enumerate("QWERTYUIOP"):
+    NAMES[16 + i] = c
+for i, c in enumerate("ASDFGHJKL"):
+    NAMES[30 + i] = c
+for i, c in enumerate("ZXCVBNM"):
+    NAMES[44 + i] = c
+
+try:
+    fd = os.open(dev, os.O_RDONLY)
+except PermissionError:
+    print("    нет прав на чтение (нужен root)", file=sys.stderr, flush=True)
+    sys.exit(2)
+
+fmt, size = "llHHi", struct.calcsize("llHHi")
+seen, last = 0, None
+deadline = time.monotonic() + wait_first
+while True:
+    now = time.monotonic()
+    if last is None:
+        if now >= deadline:          # первое нажатие так и не пришло
+            break
+    elif now - last >= IDLE_AFTER:   # нажатия были, выдержали паузу
+        break
+    ready, _, _ = select.select([fd], [], [], 0.5)
+    if not ready:
+        continue
+    data = os.read(fd, size)
+    if len(data) != size:
+        continue
+    _s, _u, etype, code, value = struct.unpack(fmt, data)
+    if etype == EV_KEY:
+        print(f"    [{ACT.get(value, value):>11}] {NAMES.get(code, f'KEY_{code}')}", flush=True)
+        seen += 1
+        last = time.monotonic()
+os.close(fd)
+print(f"    событий поймано: {seen}", flush=True)
+sys.exit(0 if seen else 1)
+PY
+    local rc=$?
+    case "$rc" in
+        0) ok "нажатия доходят — клавиатура работает" ;;
+        2) warn "нет прав на чтение event-устройства" ;;
+        *) warn "нажатий не было за ${KEYTEST_SECONDS} с. Разбуди клавиатуру (нажми любую клавишу) и попробуй снова" ;;
+    esac
+    return "$rc"
+}
+
+# После успешной настройки: состояние и (по желанию) проверка нажатий.
+finish() {
+    echo
+    show_status
+    input_present || return 0
+
+    case "$TEST" in
+        no) return 0 ;;
+        ask) ask "Проверить клавиатуру живыми нажатиями" || return 0 ;;
+    esac
+
+    test_keys "$(find_event_node)" || true
+    return 0
+}
+
+# ---------------------------------- запуск -----------------------------------
+case "$MODE" in
+    status)
+        show_status
+        if [ "$TEST" = "yes" ]; then
+            input_present && { echo; test_keys "$(find_event_node)" || true; }
+        fi
+        ;;
+
+    repair)
+        do_repair || die "не удалось настроить клавиатуру"
+        finish
+        ;;
+
+    auto)
+        if input_present; then
+            ok "клавиатура «$NAME» уже работает"
+            finish
+            exit 0
+        fi
+
+        if [ -n "$ADDR" ] && try_connect; then
+            finish
+            exit 0
+        fi
+
+        [ -n "$ADDR" ] || warn "устройство «$NAME» неизвестно — сразу перехожу к сопряжению"
+        warn "по сохранённому ключу не сработало — привязка, похоже, протухла"
+        echo
+
+        do_repair || die "не удалось настроить клавиатуру. Проверь режим сопряжения и что клавиатура не занята другим устройством"
+        finish
+        ;;
+esac
